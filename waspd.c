@@ -1037,6 +1037,11 @@ static void cleanup(void) {
         close_counter(&procs[i].dtlb_accesses);
         close_counter(&procs[i].dtlb_walks);
     }
+    
+    /* Re-enable inheritance on exit */
+    if (mitosis_available) {
+        mitosis_set_inherit(1);
+    }
 }
 
 // ============================================================================
@@ -1084,10 +1089,10 @@ int main(int argc, char *argv[]) {
     if (mitosis_available) {
         mitosis_update_status();
         
-	/* Disable inheritance - WASP manages replication per-process */
+        /* Disable inheritance - WASP manages replication per-process */
         mitosis_set_inherit(0);
-	
-	if (initial_cache > 0) {
+        
+        if (initial_cache > 0) {
             mitosis_populate_cache(initial_cache);
         }
     }
