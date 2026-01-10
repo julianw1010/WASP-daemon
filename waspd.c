@@ -1058,6 +1058,11 @@ static void print_usage(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    if (geteuid() != 0) {
+        fprintf(stderr, "Error: waspd must be run as root (use sudo)\n");
+        return 1;
+    }
+
     int initial_cache = 0;
     
     for (int i = 1; i < argc; i++) {
