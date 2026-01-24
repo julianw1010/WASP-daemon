@@ -42,11 +42,11 @@
 #define MAX_NUMA_NODES  NUMA_NODE_COUNT
 #define MAX_PROCS       256
 
-#define PTL_ITERATIONS      10
+#define PTL_ITERATIONS      100
 #define PTL_UPDATE_INTERVAL 1000
 #define PTL_PAGES           64
 
-static double THR_MAR  = 10.0 * 1000000.0;
+static double THR_MAR  = 10.0 * 10000.0;
 static double THR_DTLB = 0.01;
 #define PF_SAMPLE_INTERVAL  1000
 
@@ -526,7 +526,7 @@ static int setup_counter(perf_counter_t *pc, pid_t pid, uint32_t type, uint64_t 
     pc->pe.disabled = 1;
     pc->pe.exclude_kernel = 1;
     pc->pe.exclude_hv = 1;
-    pc->pe.inherit = 0;
+    pc->pe.inherit = 1;
     pc->fd = perf_event_open(&pc->pe, pid, -1, -1, 0);
     if (pc->fd == -1) return 0;
     ioctl(pc->fd, PERF_EVENT_IOC_RESET, 0);
