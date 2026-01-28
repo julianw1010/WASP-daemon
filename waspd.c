@@ -31,14 +31,14 @@
  * WASP: Workload-Aware Self-Replicating Page-Tables
  * TUI version with automatic steering matrix
  * 
- * Updated to work with Mitosis kernel module /proc interfaces
+ * Updated for Intel Sandy Bridge-EP (Xeon E5-4620) perf counters
  */
 
 // ============================================================================
-// CONFIGURATION - Must match kernel's NUMA_NODE_COUNT in mm_types.h
+// CONFIGURATION
 // ============================================================================
 
-#define NUMA_NODE_COUNT 8   /* Must match kernel definition */
+#define NUMA_NODE_COUNT 8
 #define MAX_NUMA_NODES  NUMA_NODE_COUNT
 #define MAX_PROCS       256
 
@@ -46,14 +46,14 @@
 #define PTL_UPDATE_INTERVAL 1000
 #define PTL_PAGES           64
 
-static double THR_MAR  = 10.0 * 10000.0;
+static double THR_MAR  = 10.0 * 1000000.0;
 static double THR_DTLB = 0.01;
-#define PF_SAMPLE_INTERVAL  1000
+#define PF_SAMPLE_INTERVAL  2000
 
 static int UPDATE_INTERVAL_MS = 1000;
 static int HYSTERESIS_MS = 1000;
 
-/* prctl commands - must match kernel's include/uapi/linux/prctl.h */
+/* prctl commands */
 #ifndef PR_SET_PGTABLE_REPL
 #define PR_SET_PGTABLE_REPL          100
 #endif
@@ -74,6 +74,41 @@ static int HYSTERESIS_MS = 1000;
 #define MITOSIS_MODE_PATH    MITOSIS_PROC_DIR "/mode"
 #define MITOSIS_INHERIT_PATH MITOSIS_PROC_DIR "/inherit"
 #define MITOSIS_CACHE_PATH   MITOSIS_PROC_DIR "/cache"
+
+// ============================================================================
+// INTEL SANDY BRIDGE-EP RAW PERF EVENT CODES
+// ============================================================================
+/*
+ * Sandy Bridge-EP (Model 45) performance monitoring events
+ * Format: (umask << 8) | event_select
+ * 
+ * Reference: Intel SDM Vol 3B, Chapter 19
+ */
+
+/* Memory load events - MEM_LOAD_UOPS_RETIRED (Event D1H) */
+#define SNB_MEM_LOAD_RETIRED_L1_HIT   0x01D1  /* Umask 01H: L1 hit */
+#define SNB_MEM_LOAD_RETIRED_L2_HIT   0x02D1  /* Umask 02H: L2 hit */
+#define SNB_MEM_LOAD_RETIRED_L3_HIT   0x04D1  /* Umask 04H: LLC hit */
+#define SNB_MEM_LOAD_RETIRED_L1_MISS  0x08D1  /* Umask 08H: L1 miss */
+#define SNB_MEM_LOAD_RETIRED_L2_MISS  0x10D1  /* Umask 10H: L2 miss */
+#define SNB_MEM_LOAD_RETIRED_HIT_LFB  0x40D1  /* Umask 40H: Hit LFB */
+
+/* DTLB events - DTLB_LOAD_MISSES (Event 08H) */
+#define SNB_DTLB_LOAD_MISS_WALK       0x0108  /* Umask 01H: Miss causes walk */
+#define SNB_DTLB_LOAD_WALK_COMPLETED  0x0208  /* Umask 02H: Walk completed */
+#define SNB_DTLB_LOAD_WALK_DURATION   0x0408  /* Umask 04H: Walk duration (cycles) */
+#define SNB_DTLB_LOAD_STLB_HIT        0x1008  /* Umask 10H: STLB hit */
+
+/* DTLB store events - DTLB_STORE_MISSES (Event 49H) */
+#define SNB_DTLB_STORE_MISS_WALK      0x0149  /* Umask 01H: Store miss causes walk */
+#define SNB_DTLB_STORE_WALK_COMPLETED 0x0249  /* Umask 02H: Store walk completed */
+
+/* Alternative: Use MEM_UOPS_RETIRED for all memory operations */
+#define SNB_MEM_UOPS_RETIRED_ALL_LOADS  0x81D0  /* All load uops retired */
+#define SNB_MEM_UOPS_RETIRED_ALL_STORES 0x82D0  /* All store uops retired */
+
+/* Instructions retired (for reference/fallback) */
+#define SNB_INST_RETIRED_ANY          0x00C0  /* Event C0H, Umask 00H */
 
 // ============================================================================
 // SYSTEM PROCESS BLACKLIST
@@ -142,7 +177,7 @@ static int is_system_process(const char *name) {
 
 volatile sig_atomic_t stop_requested = 0;
 static pid_t daemon_pid = 0;
-static double cpu_ghz = 2.8;
+static double cpu_ghz = 2.2;  /* Default for E5-4620 */
 static int ptl_interval = PTL_UPDATE_INTERVAL;
 static struct termios orig_termios;
 static int term_rows = 24, term_cols = 80;
@@ -150,15 +185,19 @@ static int term_rows = 24, term_cols = 80;
 int num_online_nodes = 0;
 int node_to_cpu_map[MAX_NUMA_NODES];
 double ptl_matrix[MAX_NUMA_NODES][MAX_NUMA_NODES];
-int steering_matrix[NUMA_NODE_COUNT];  /* Global steering: phys_node -> replica_node */
+int steering_matrix[NUMA_NODE_COUNT];
 double last_ptl_update = 0;
 double last_ptl_duration = 0;
 int ptl_measuring = 0;
 
+/* Counter availability flags */
+static int use_raw_events = 1;  /* Default: use raw events for Sandy Bridge */
+static int raw_events_tested = 0;
+
 /* Mitosis kernel status */
 int mitosis_available = 0;
-int mitosis_mode = -1;       /* From /proc/mitosis/mode */
-int mitosis_inherit = 1;     /* From /proc/mitosis/inherit */
+int mitosis_mode = -1;
+int mitosis_inherit = 1;
 size_t cache_total_pages = 0;
 size_t cache_per_node[NUMA_NODE_COUNT];
 
@@ -169,17 +208,18 @@ size_t cache_per_node[NUMA_NODE_COUNT];
 typedef struct {
     int fd;
     struct perf_event_attr pe;
+    int is_raw;  /* Track if using raw event */
 } perf_counter_t;
 
 typedef struct {
     pid_t tgid;
     char name[32];
-    perf_counter_t mem_loads;
-    perf_counter_t dtlb_walks;
-    perf_counter_t dtlb_accesses;
+    perf_counter_t mem_loads;      /* Memory loads (for MAR) */
+    perf_counter_t dtlb_walks;     /* DTLB miss causes walk */
+    perf_counter_t dtlb_walk_completed;  /* DTLB walks completed (alternative) */
     long long prev_mem_loads;
     long long prev_dtlb_walks;
-    long long prev_dtlb_accesses;
+    long long prev_dtlb_walk_completed;
     double last_sample_time;
     double last_mar;
     double last_dtlb_mr;
@@ -230,15 +270,43 @@ static void detect_cpu_freq(void) {
     if (f) {
         char line[256];
         while (fgets(line, sizeof(line), f)) {
-            double mhz;
-            if (sscanf(line, "cpu MHz : %lf", &mhz) == 1) {
-                cpu_ghz = mhz / 1000.0;
-                fclose(f);
-                return;
+            /*
+             * Parse base frequency from model name: "Intel... @ 2.20GHz"
+             * This is the TSC rate on Sandy Bridge with constant_tsc.
+             * Do NOT use "cpu MHz" as that shows current dynamic frequency.
+             */
+            if (strncmp(line, "model name", 10) == 0) {
+                char *at = strstr(line, "@ ");
+                if (at) {
+                    double ghz;
+                    if (sscanf(at, "@ %lfGHz", &ghz) == 1) {
+                        cpu_ghz = ghz;
+                        fclose(f);
+                        return;
+                    }
+                }
             }
         }
         fclose(f);
     }
+    /* Fallback for E5-4620 base frequency */
+    cpu_ghz = 2.2;
+}
+
+static int detect_cpu_model(void) {
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            int model;
+            if (sscanf(line, "model : %d", &model) == 1) {
+                fclose(f);
+                return model;
+            }
+        }
+        fclose(f);
+    }
+    return -1;
 }
 
 static double get_time_ms(void) {
@@ -367,7 +435,7 @@ static void init_topology(void) {
     int nodes_found = 0;
     for (int i = 0; i < MAX_NUMA_NODES; i++) {
         node_to_cpu_map[i] = -1;
-        steering_matrix[i] = -1;  /* Default: auto (use local) */
+        steering_matrix[i] = -1;
         for (int j = 0; j < MAX_NUMA_NODES; j++)
             ptl_matrix[i][j] = 0;
         
@@ -389,7 +457,7 @@ static void init_topology(void) {
 }
 
 // ============================================================================
-// PTL MEASUREMENT & STEERING MATRIX COMPUTATION
+// PTL MEASUREMENT & STEERING MATRIX
 // ============================================================================
 
 static void compute_steering_matrix(void) {
@@ -414,7 +482,6 @@ static void compute_steering_matrix(void) {
         steering_matrix[phys] = best_node;
     }
     
-    /* Initialize remaining entries to -1 (auto) */
     for (int i = num_online_nodes; i < NUMA_NODE_COUNT; i++) {
         steering_matrix[i] = -1;
     }
@@ -515,20 +582,72 @@ static void update_ptl_matrix(void) {
 }
 
 // ============================================================================
-// PERF COUNTERS
+// PERF COUNTERS - SANDY BRIDGE OPTIMIZED
 // ============================================================================
 
-static int setup_counter(perf_counter_t *pc, pid_t pid, uint32_t type, uint64_t config) {
+/*
+ * Setup a raw performance counter (Intel-specific encoding)
+ * config = (umask << 8) | event_select
+ */
+static int setup_raw_counter(perf_counter_t *pc, pid_t pid, uint64_t raw_config) {
     memset(&pc->pe, 0, sizeof(pc->pe));
-    pc->pe.type = type;
+    pc->pe.type = PERF_TYPE_RAW;
+    pc->pe.size = sizeof(pc->pe);
+    pc->pe.config = raw_config;
+    pc->pe.disabled = 1;
+    pc->pe.exclude_kernel = 1;
+    pc->pe.exclude_hv = 1;
+    pc->pe.inherit = 1;
+    pc->is_raw = 1;
+    
+    pc->fd = perf_event_open(&pc->pe, pid, -1, -1, 0);
+    if (pc->fd == -1) return 0;
+    
+    ioctl(pc->fd, PERF_EVENT_IOC_RESET, 0);
+    ioctl(pc->fd, PERF_EVENT_IOC_ENABLE, 0);
+    return 1;
+}
+
+/*
+ * Setup a generic HW_CACHE counter (fallback)
+ */
+static int setup_cache_counter(perf_counter_t *pc, pid_t pid, 
+                                uint64_t cache_id, uint64_t op, uint64_t result) {
+    memset(&pc->pe, 0, sizeof(pc->pe));
+    pc->pe.type = PERF_TYPE_HW_CACHE;
+    pc->pe.size = sizeof(pc->pe);
+    pc->pe.config = cache_id | (op << 8) | (result << 16);
+    pc->pe.disabled = 1;
+    pc->pe.exclude_kernel = 1;
+    pc->pe.exclude_hv = 1;
+    pc->pe.inherit = 1;
+    pc->is_raw = 0;
+    
+    pc->fd = perf_event_open(&pc->pe, pid, -1, -1, 0);
+    if (pc->fd == -1) return 0;
+    
+    ioctl(pc->fd, PERF_EVENT_IOC_RESET, 0);
+    ioctl(pc->fd, PERF_EVENT_IOC_ENABLE, 0);
+    return 1;
+}
+
+/*
+ * Setup a generic hardware counter
+ */
+static int setup_hw_counter(perf_counter_t *pc, pid_t pid, uint64_t config) {
+    memset(&pc->pe, 0, sizeof(pc->pe));
+    pc->pe.type = PERF_TYPE_HARDWARE;
     pc->pe.size = sizeof(pc->pe);
     pc->pe.config = config;
     pc->pe.disabled = 1;
     pc->pe.exclude_kernel = 1;
     pc->pe.exclude_hv = 1;
     pc->pe.inherit = 1;
+    pc->is_raw = 0;
+    
     pc->fd = perf_event_open(&pc->pe, pid, -1, -1, 0);
     if (pc->fd == -1) return 0;
+    
     ioctl(pc->fd, PERF_EVENT_IOC_RESET, 0);
     ioctl(pc->fd, PERF_EVENT_IOC_ENABLE, 0);
     return 1;
@@ -542,6 +661,81 @@ static long long read_counter(perf_counter_t *pc) {
 
 static void close_counter(perf_counter_t *pc) {
     if (pc->fd != -1) { close(pc->fd); pc->fd = -1; }
+}
+
+/*
+ * Test if raw events work on this system
+ */
+static void test_raw_events(void) {
+    if (raw_events_tested) return;
+    raw_events_tested = 1;
+    
+    perf_counter_t test;
+    test.fd = -1;
+    
+    /* Try to open a raw DTLB counter for self */
+    if (setup_raw_counter(&test, 0, SNB_DTLB_LOAD_MISS_WALK)) {
+        close_counter(&test);
+        use_raw_events = 1;
+    } else {
+        use_raw_events = 0;
+    }
+}
+
+/*
+ * Setup all counters for a process - Sandy Bridge optimized
+ */
+static int setup_process_counters(process_t *p) {
+    int success = 0;
+    
+    test_raw_events();
+    
+    if (use_raw_events) {
+        /*
+         * Sandy Bridge raw events:
+         * - MEM_LOAD_UOPS_RETIRED.L1_HIT for memory access rate
+         * - DTLB_LOAD_MISSES.MISS_CAUSES_A_WALK for TLB misses
+         * - DTLB_LOAD_MISSES.WALK_COMPLETED as alternative/verification
+         */
+        
+        /* Memory loads - try multiple options */
+        if (!setup_raw_counter(&p->mem_loads, p->tgid, SNB_MEM_LOAD_RETIRED_L1_HIT)) {
+            /* Fallback: try all loads */
+            if (!setup_raw_counter(&p->mem_loads, p->tgid, SNB_MEM_UOPS_RETIRED_ALL_LOADS)) {
+                /* Last resort: generic L1D cache */
+                setup_cache_counter(&p->mem_loads, p->tgid,
+                    PERF_COUNT_HW_CACHE_L1D,
+                    PERF_COUNT_HW_CACHE_OP_READ,
+                    PERF_COUNT_HW_CACHE_RESULT_ACCESS);
+            }
+        }
+        
+        /* DTLB walks (misses that cause page table walk) */
+        if (!setup_raw_counter(&p->dtlb_walks, p->tgid, SNB_DTLB_LOAD_MISS_WALK)) {
+            /* Fallback: try walk completed */
+            setup_raw_counter(&p->dtlb_walks, p->tgid, SNB_DTLB_LOAD_WALK_COMPLETED);
+        }
+        
+        /* DTLB walk completed - for cross-verification */
+        setup_raw_counter(&p->dtlb_walk_completed, p->tgid, SNB_DTLB_LOAD_WALK_COMPLETED);
+        
+    } else {
+        /* Fallback to generic HW_CACHE events */
+        setup_cache_counter(&p->mem_loads, p->tgid,
+            PERF_COUNT_HW_CACHE_L1D,
+            PERF_COUNT_HW_CACHE_OP_READ,
+            PERF_COUNT_HW_CACHE_RESULT_ACCESS);
+        
+        setup_cache_counter(&p->dtlb_walks, p->tgid,
+            PERF_COUNT_HW_CACHE_DTLB,
+            PERF_COUNT_HW_CACHE_OP_READ,
+            PERF_COUNT_HW_CACHE_RESULT_MISS);
+        
+        p->dtlb_walk_completed.fd = -1;
+    }
+    
+    success = (p->mem_loads.fd != -1);
+    return success;
 }
 
 // ============================================================================
@@ -640,25 +834,17 @@ static void add_process(pid_t pid) {
     p->tgid = tgid;
     p->mem_loads.fd = -1;
     p->dtlb_walks.fd = -1;
-    p->dtlb_accesses.fd = -1;
+    p->dtlb_walk_completed.fd = -1;
     
     strncpy(p->name, name, sizeof(p->name) - 1);
     
-    if (!setup_counter(&p->mem_loads, tgid, PERF_TYPE_HW_CACHE,
-        PERF_COUNT_HW_CACHE_L1D | (PERF_COUNT_HW_CACHE_OP_READ << 8) |
-        (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16))) {
+    if (!setup_process_counters(p)) {
         return;
     }
-    setup_counter(&p->dtlb_accesses, tgid, PERF_TYPE_HW_CACHE,
-        PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) |
-        (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16));
-    setup_counter(&p->dtlb_walks, tgid, PERF_TYPE_HW_CACHE,
-        PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) |
-        (PERF_COUNT_HW_CACHE_RESULT_MISS << 16));
     
     p->prev_mem_loads = read_counter(&p->mem_loads);
-    p->prev_dtlb_accesses = (p->dtlb_accesses.fd != -1) ? read_counter(&p->dtlb_accesses) : 0;
     p->prev_dtlb_walks = (p->dtlb_walks.fd != -1) ? read_counter(&p->dtlb_walks) : 0;
+    p->prev_dtlb_walk_completed = (p->dtlb_walk_completed.fd != -1) ? read_counter(&p->dtlb_walk_completed) : 0;
     p->last_sample_time = get_time_ms();
     
     get_page_faults(tgid, &p->prev_majflt, &p->prev_minflt);
@@ -676,8 +862,8 @@ static void cleanup_dead_processes(void) {
         if (kill(procs[i].tgid, 0) == -1 && errno == ESRCH) {
             if (procs[i].mitosis_enabled) mitosis_count--;
             close_counter(&procs[i].mem_loads);
-            close_counter(&procs[i].dtlb_accesses);
             close_counter(&procs[i].dtlb_walks);
+            close_counter(&procs[i].dtlb_walk_completed);
             procs[i].active = 0;
         }
     }
@@ -705,26 +891,14 @@ static void scan_processes(void) {
 static void apply_steering_matrix(process_t *p) {
     if (!p->mitosis_enabled) return;
     
-    /*
-     * PR_SET_PGTABLE_REPL_STEERING:
-     *   arg2 = pointer to int[NUMA_NODE_COUNT] steering array
-     *   arg3 = target PID (0 = self, >0 = other process)
-     */
     if (prctl(PR_SET_PGTABLE_REPL_STEERING, steering_matrix, p->tgid, 0, 0) != 0) {
-        /* Ignore errors - process may have exited */
+        /* Ignore errors */
     }
 }
 
 static void enable_mitosis(process_t *p) {
     if (p->mitosis_enabled) return;
     
-    /*
-     * PR_SET_PGTABLE_REPL:
-     *   arg2 = 0: disable
-     *   arg2 = 1: enable on all online nodes
-     *   arg2 = bitmask: enable on specific nodes
-     *   arg3 = target PID (0 = self, >0 = other process)
-     */
     if (prctl(PR_SET_PGTABLE_REPL, 1, p->tgid, 0, 0) == 0) {
         p->mitosis_enabled = 1;
         mitosis_count++;
@@ -753,28 +927,42 @@ static void update_and_decide(void) {
         if (!p->active) continue;
         
         long long ml = read_counter(&p->mem_loads);
-        long long da = (p->dtlb_accesses.fd != -1) ? read_counter(&p->dtlb_accesses) : 0;
         long long dw = (p->dtlb_walks.fd != -1) ? read_counter(&p->dtlb_walks) : 0;
+        long long dwc = (p->dtlb_walk_completed.fd != -1) ? read_counter(&p->dtlb_walk_completed) : 0;
         
         long long d_mem = ml - p->prev_mem_loads;
-        long long d_acc = da - p->prev_dtlb_accesses;
         long long d_walk = dw - p->prev_dtlb_walks;
+        long long d_walk_comp = dwc - p->prev_dtlb_walk_completed;
         
         double elapsed_ms = now - p->last_sample_time;
         if (elapsed_ms < 1.0) elapsed_ms = 1.0;
         
         p->prev_mem_loads = ml;
-        p->prev_dtlb_accesses = da;
         p->prev_dtlb_walks = dw;
+        p->prev_dtlb_walk_completed = dwc;
         p->last_sample_time = now;
         
         if (d_mem < 0) d_mem = 0;
-        if (d_acc < 0) d_acc = 0;
         if (d_walk < 0) d_walk = 0;
+        if (d_walk_comp < 0) d_walk_comp = 0;
         
+        /* Memory Access Rate (loads per second) */
         p->last_mar = (double)d_mem * 1000.0 / elapsed_ms;
-        p->last_dtlb_mr = (d_acc > 0) ? (double)d_walk / d_acc : 0.0;
         
+        /*
+         * DTLB miss ratio: walks / memory_loads
+         * For Sandy Bridge, we use DTLB_LOAD_MISSES.MISS_CAUSES_A_WALK
+         * divided by total memory loads as the miss ratio
+         */
+        if (d_mem > 0) {
+            /* Use the better of the two walk counters */
+            long long walks = (d_walk > 0) ? d_walk : d_walk_comp;
+            p->last_dtlb_mr = (double)walks / (double)d_mem;
+        } else {
+            p->last_dtlb_mr = 0.0;
+        }
+        
+        /* Page fault rate sampling */
         if (now - p->last_pf_sample_time >= PF_SAMPLE_INTERVAL) {
             long long majflt, minflt;
             if (get_page_faults(p->tgid, &majflt, &minflt)) {
@@ -860,7 +1048,7 @@ static void draw_header(void) {
            cpu_ghz, num_online_nodes, HYSTERESIS_MS, tm->tm_hour, tm->tm_min, tm->tm_sec);
     printf(ESC "[K" RESET);
     
-    /* Mitosis kernel status */
+    /* Show counter mode */
     GOTO(3, 1);
     if (mitosis_available) {
         const char *inh_str = (mitosis_inherit == 1) ? "on" : "off";
@@ -869,6 +1057,7 @@ static void draw_header(void) {
     } else {
         printf(RED " Mitosis: kernel module not loaded" RESET);
     }
+    printf("  " DIM "[%s events]" RESET, use_raw_events ? "raw SNB" : "generic");
     printf(ESC "[K");
 }
 
@@ -1034,11 +1223,10 @@ static void cleanup(void) {
         if (procs[i].mitosis_enabled)
             prctl(PR_SET_PGTABLE_REPL, 0, procs[i].tgid, 0, 0);
         close_counter(&procs[i].mem_loads);
-        close_counter(&procs[i].dtlb_accesses);
         close_counter(&procs[i].dtlb_walks);
+        close_counter(&procs[i].dtlb_walk_completed);
     }
     
-    /* Re-enable inheritance on exit */
     if (mitosis_available) {
         mitosis_set_inherit(1);
     }
@@ -1054,6 +1242,7 @@ static void print_usage(const char *prog) {
     printf("  -u N     Main loop interval in ms [default: %d]\n", UPDATE_INTERVAL_MS);
     printf("  -y N     Hysteresis duration in ms [default: %d]\n", HYSTERESIS_MS);
     printf("  -c N     Pre-populate cache with N pages/node\n");
+    printf("  -g       Force generic HW_CACHE events (disable raw)\n");
     printf("  -h       Show this help\n");
 }
 
@@ -1064,6 +1253,7 @@ int main(int argc, char *argv[]) {
     }
 
     int initial_cache = 0;
+    int force_generic = 0;
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0) { print_usage(argv[0]); return 0; }
@@ -1071,10 +1261,22 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "-u") == 0 && i + 1 < argc) UPDATE_INTERVAL_MS = atoi(argv[++i]);
         else if (strcmp(argv[i], "-y") == 0 && i + 1 < argc) HYSTERESIS_MS = atoi(argv[++i]);
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) initial_cache = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-g") == 0) force_generic = 1;
     }
     
     daemon_pid = getpid();
     detect_cpu_freq();
+    
+    int cpu_model = detect_cpu_model();
+    if (cpu_model != 45) {
+        fprintf(stderr, "Warning: Expected Sandy Bridge-EP (model 45), detected model %d\n", cpu_model);
+        fprintf(stderr, "         Raw events may not work correctly. Use -g for generic events.\n");
+    }
+    
+    if (force_generic) {
+        use_raw_events = 0;
+        raw_events_tested = 1;
+    }
     
     struct rlimit rlim = {65536, 65536};
     setrlimit(RLIMIT_NOFILE, &rlim);
@@ -1089,12 +1291,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    /* Check mitosis availability and optionally populate cache */
     mitosis_available = mitosis_check_available();
     if (mitosis_available) {
         mitosis_update_status();
-        
-        /* Disable inheritance - WASP manages replication per-process */
         mitosis_set_inherit(0);
         
         if (initial_cache > 0) {
@@ -1114,19 +1313,16 @@ int main(int argc, char *argv[]) {
                 last_ptl_update = 0;
             }
             if (c == 'c' || c == 'C') {
-                /* Add 100 pages per node to cache */
                 if (mitosis_available) {
                     mitosis_populate_cache(100);
                 }
             }
             if (c == 'd' || c == 'D') {
-                /* Drain cache */
                 if (mitosis_available) {
                     mitosis_drain_cache();
                 }
             }
             if (c == 'm' || c == 'M') {
-                /* Toggle mode: -1 -> 0 -> 1 -> -1 */
                 if (mitosis_available) {
                     int new_mode = (mitosis_mode + 2) % 3 - 1;
                     mitosis_set_mode(new_mode);
