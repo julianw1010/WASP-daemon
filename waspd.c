@@ -45,8 +45,6 @@ static int HYSTERESIS_MS = 1000;
 
 static int numa_node_count = 0;
 
-static int node_mask_enabled[MAX_NUMA_NODES];
-static int node_mask_set = 0;
 static int active_node_count = 0;
 
 #ifndef PR_SET_PGTABLE_REPL
@@ -63,7 +61,6 @@ static int active_node_count = 0;
 #endif
 
 #define MITOSIS_PROC_DIR     "/proc/mitosis"
-#define MITOSIS_MODE_PATH    MITOSIS_PROC_DIR "/mode"
 #define MITOSIS_INHERIT_PATH MITOSIS_PROC_DIR "/inherit"
 #define MITOSIS_CACHE_PATH   MITOSIS_PROC_DIR "/cache"
 
@@ -71,6 +68,7 @@ static int active_node_count = 0;
 #define SNB_DTLB_LOAD_WALK_COMPLETED  0x0208
 #define SNB_DTLB_LOAD_WALK_DURATION   0x0408
 #define SNB_DTLB_LOAD_STLB_HIT        0x1008
+#define SNB_DTLB_STORE_MISS_WALK      0x0149
 
 #define SNB_MEM_LOAD_RETIRED_L1_HIT   0x01D1
 #define SNB_MEM_LOAD_RETIRED_L2_HIT   0x02D1
@@ -84,6 +82,7 @@ static int active_node_count = 0;
 #define SKX_DTLB_LOAD_WALK_COMPLETED  0x0E08
 #define SKX_DTLB_LOAD_WALK_PENDING    0x1008
 #define SKX_DTLB_LOAD_STLB_HIT        0x2008
+#define SKX_DTLB_STORE_MISS_WALK      0x0149
 
 #define SKX_MEM_LOAD_RETIRED_L1_HIT   0x01D1
 #define SKX_MEM_LOAD_RETIRED_L2_HIT   0x02D1
@@ -184,7 +183,7 @@ int ptl_measuring = 0;
 
 static int use_raw_events = 1, raw_events_tested = 0;
 
-int mitosis_available = 0, mitosis_mode = -1, mitosis_inherit = 1;
+int mitosis_available = 0, mitosis_inherit = 1;
 size_t cache_total_pages = 0;
 size_t cache_per_node[MAX_NUMA_NODES];
 
@@ -201,9 +200,11 @@ typedef struct {
 
 typedef struct {
     int fds[MAX_THREADS];
+    pid_t tids[MAX_THREADS];
     int num_fds;
     struct perf_event_attr pe;
     int is_raw;
+    int active;
 } perf_counter_t;
 
 typedef struct {
@@ -212,14 +213,19 @@ typedef struct {
     perf_counter_t mem_loads;
     perf_counter_t dtlb_walks;
     perf_counter_t dtlb_walk_completed;
+    perf_counter_t mem_stores;
+    perf_counter_t dtlb_store_walks;
     counter_reading_t prev_mem_loads_rd;
     counter_reading_t prev_dtlb_walks_rd;
     counter_reading_t prev_dtlb_walk_completed_rd;
+    counter_reading_t prev_mem_stores_rd;
+    counter_reading_t prev_dtlb_store_walks_rd;
     double last_sample_time;
     double last_mar;
     double last_dtlb_mr;
     double multiplex_pct;
     int mitosis_enabled;
+    int steering_applied;
     long long prev_majflt, prev_minflt;
     double last_pf_sample_time, last_pf_rate;
     int active;
@@ -468,23 +474,33 @@ static int mitosis_read_int(const char *path) {
     char buf[256];
     while (fgets(buf, sizeof(buf), f)) {
         if (sscanf(buf, "%d", &v) == 1) break;
-        if (sscanf(buf, " Current mode: %d", &v) == 1) break;
     }
     fclose(f);
     return v;
 }
+
 static int mitosis_write_int(const char *path, int val) {
     FILE *f = fopen(path, "w"); if (!f) return -1;
     fprintf(f, "%d\n", val); fclose(f); return 0;
 }
 
+static int mitosis_set_inherit(int i) { return mitosis_write_int(MITOSIS_INHERIT_PATH, i); }
 static void mitosis_read_cache_status(void) {
     cache_total_pages = 0; memset(cache_per_node, 0, sizeof(cache_per_node));
     FILE *f = fopen(MITOSIS_CACHE_PATH, "r"); if (!f) return;
-    char line[256]; int node; int count;
+    char line[1024];
     while (fgets(line, sizeof(line), f)) {
-        if (sscanf(line, "%d %d", &node, &count) >= 2 && node >= 0 && node < MAX_NUMA_NODES)
-            { cache_per_node[node] = count; cache_total_pages += count; }
+        char *tok = strtok(line, " \t\n");
+        if (!tok || strcmp(tok, "pages") != 0) continue;
+        int node = 0;
+        while ((tok = strtok(NULL, " \t\n")) && node < numa_node_count && node < MAX_NUMA_NODES) {
+            long count = atol(tok);
+            if (count < 0) count = 0;
+            cache_per_node[node] = count;
+            cache_total_pages += count;
+            node++;
+        }
+        break;
     }
     fclose(f);
 }
@@ -492,16 +508,10 @@ static void mitosis_read_cache_status(void) {
 static void mitosis_update_status(void) {
     if (!mitosis_available) mitosis_available = mitosis_check_available();
     if (mitosis_available) {
-        mitosis_mode = mitosis_read_int(MITOSIS_MODE_PATH);
         mitosis_inherit = mitosis_read_int(MITOSIS_INHERIT_PATH);
         mitosis_read_cache_status();
     }
 }
-
-static int mitosis_set_mode(int m)       { return mitosis_write_int(MITOSIS_MODE_PATH, m); }
-static int mitosis_set_inherit(int i)    { return mitosis_write_int(MITOSIS_INHERIT_PATH, i); }
-static int mitosis_populate_cache(int n) { return mitosis_write_int(MITOSIS_CACHE_PATH, n); }
-static int mitosis_drain_cache(void)     { return mitosis_write_int(MITOSIS_CACHE_PATH, -1); }
 
 static void get_term_size(void) {
     struct winsize ws;
@@ -560,13 +570,6 @@ static void init_topology(void) {
     }
 }
 
-static void apply_node_subset(void) {
-    if (!node_mask_set) return;
-    for (int i = 0; i < MAX_NUMA_NODES; i++)
-        if (!node_mask_enabled[i]) node_to_cpu_map[i] = -1;
-    active_node_count = count_active_nodes();
-}
-
 static void compute_steering_matrix(void) {
     for (int ph = 0; ph < numa_node_count; ph++) {
         if (node_to_cpu_map[ph] == -1) { steering_matrix[ph] = -1; continue; }
@@ -581,18 +584,6 @@ static void compute_steering_matrix(void) {
     }
     for (int i = numa_node_count; i < MAX_NUMA_NODES; i++)
         steering_matrix[i] = -1;
-}
-
-static unsigned long build_node_bitmask(void) {
-    unsigned long mask = 0;
-    int count = 0;
-    for (int i = 0; i < numa_node_count && i < (int)(sizeof(unsigned long) * 8); i++) {
-        if (node_to_cpu_map[i] != -1) {
-            mask |= (1UL << i);
-            count++;
-        }
-    }
-    return (count < 2) ? 0 : mask;
 }
 
 static void init_ptl_buffers(void) {
@@ -646,6 +637,7 @@ static void update_ptl_matrix(void) {
     double now = get_time_ms();
     if (now - last_ptl_update < ptl_interval) return;
     if (!ptl_buffers_ready || !ptl_shared_results) return;
+    if (mitosis_count == 0) return;
 
     last_ptl_update = now;
     ptl_measuring = 1;
@@ -708,7 +700,8 @@ static void update_ptl_matrix(void) {
         }
         _exit(0);
     } else if (pid > 0) {
-        waitpid(pid, NULL, 0);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+            ;
         for (int s = 0; s < numa_node_count; s++)
             for (int d = 0; d < numa_node_count; d++)
                 ptl_matrix[s][d] = ptl_shared_results[s][d];
@@ -761,7 +754,9 @@ static int open_counter_fds(perf_counter_t *pc, pid_t tgid) {
         if (fd != -1) {
             ioctl(fd, PERF_EVENT_IOC_RESET, 0);
             ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-            pc->fds[pc->num_fds++] = fd;
+            pc->fds[pc->num_fds] = fd;
+            pc->tids[pc->num_fds] = tids[i];
+            pc->num_fds++;
             ok = 1;
         }
     }
@@ -772,6 +767,7 @@ static int setup_raw_counter(perf_counter_t *pc, pid_t tgid, uint64_t cfg) {
     init_counter(pc);
     init_pe_common(&pc->pe);
     pc->pe.type = PERF_TYPE_RAW; pc->pe.config = cfg; pc->is_raw = 1;
+    pc->active = 1;
     return open_counter_fds(pc, tgid);
 }
 
@@ -781,6 +777,7 @@ static int setup_cache_counter(perf_counter_t *pc, pid_t tgid,
     init_pe_common(&pc->pe);
     pc->pe.type = PERF_TYPE_HW_CACHE;
     pc->pe.config = cid | (op << 8) | (res << 16); pc->is_raw = 0;
+    pc->active = 1;
     return open_counter_fds(pc, tgid);
 }
 
@@ -808,42 +805,55 @@ static void test_raw_events(void) {
     else use_raw_events = 0;
 }
 
-static int setup_process_counters_intel_skx(process_t *p) {
-    if (!setup_raw_counter(&p->mem_loads, p->tgid, SKX_MEM_LOAD_RETIRED_L1_HIT))
-        if (!setup_raw_counter(&p->mem_loads, p->tgid, SKX_MEM_INST_RETIRED_ALL_LOADS))
+struct uarch_events {
+    uint64_t mem_primary, mem_fallback, mem_store;
+    uint64_t dtlb_primary, dtlb_fallback, dtlb_store;
+    uint64_t dtlb_completed;
+};
+
+static const struct uarch_events skx_events = {
+    SKX_MEM_LOAD_RETIRED_L1_HIT, SKX_MEM_INST_RETIRED_ALL_LOADS, SKX_MEM_INST_RETIRED_ALL_STORES,
+    SKX_DTLB_LOAD_MISS_WALK, SKX_DTLB_LOAD_WALK_COMPLETED, SKX_DTLB_STORE_MISS_WALK,
+    SKX_DTLB_LOAD_WALK_COMPLETED,
+};
+
+static const struct uarch_events snb_events = {
+    SNB_MEM_LOAD_RETIRED_L1_HIT, SNB_MEM_UOPS_RETIRED_ALL_LOADS, SNB_MEM_UOPS_RETIRED_ALL_STORES,
+    SNB_DTLB_LOAD_MISS_WALK, SNB_DTLB_LOAD_WALK_COMPLETED, SNB_DTLB_STORE_MISS_WALK,
+    SNB_DTLB_LOAD_WALK_COMPLETED,
+};
+
+static const struct uarch_events amd_events = {
+    AMD_LS_DISPATCH_LOADS, AMD_LS_DISPATCH_ALL, 0,
+    AMD_L1_DTLB_MISS, AMD_DTLB_LOAD_MISS_WALK, 0,
+    0,
+};
+
+static int setup_process_counters_raw(process_t *p, const struct uarch_events *ev) {
+    if (!setup_raw_counter(&p->mem_loads, p->tgid, ev->mem_primary))
+        if (!ev->mem_fallback || !setup_raw_counter(&p->mem_loads, p->tgid, ev->mem_fallback))
             setup_cache_counter(&p->mem_loads, p->tgid,
                 PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
 
-    if (!setup_raw_counter(&p->dtlb_walks, p->tgid, SKX_DTLB_LOAD_MISS_WALK))
-        setup_raw_counter(&p->dtlb_walks, p->tgid, SKX_DTLB_LOAD_WALK_COMPLETED);
+    if (!setup_raw_counter(&p->dtlb_walks, p->tgid, ev->dtlb_primary))
+        if (ev->dtlb_fallback)
+            setup_raw_counter(&p->dtlb_walks, p->tgid, ev->dtlb_fallback);
 
-    setup_raw_counter(&p->dtlb_walk_completed, p->tgid, SKX_DTLB_LOAD_WALK_COMPLETED);
-    return (p->mem_loads.num_fds > 0);
-}
+    if (ev->dtlb_completed)
+        setup_raw_counter(&p->dtlb_walk_completed, p->tgid, ev->dtlb_completed);
+    else
+        init_counter(&p->dtlb_walk_completed);
 
-static int setup_process_counters_intel_snb(process_t *p) {
-    if (!setup_raw_counter(&p->mem_loads, p->tgid, SNB_MEM_LOAD_RETIRED_L1_HIT))
-        if (!setup_raw_counter(&p->mem_loads, p->tgid, SNB_MEM_UOPS_RETIRED_ALL_LOADS))
-            setup_cache_counter(&p->mem_loads, p->tgid,
-                PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
+    if (ev->mem_store)
+        setup_raw_counter(&p->mem_stores, p->tgid, ev->mem_store);
+    else
+        init_counter(&p->mem_stores);
 
-    if (!setup_raw_counter(&p->dtlb_walks, p->tgid, SNB_DTLB_LOAD_MISS_WALK))
-        setup_raw_counter(&p->dtlb_walks, p->tgid, SNB_DTLB_LOAD_WALK_COMPLETED);
+    if (ev->dtlb_store)
+        setup_raw_counter(&p->dtlb_store_walks, p->tgid, ev->dtlb_store);
+    else
+        init_counter(&p->dtlb_store_walks);
 
-    setup_raw_counter(&p->dtlb_walk_completed, p->tgid, SNB_DTLB_LOAD_WALK_COMPLETED);
-    return (p->mem_loads.num_fds > 0);
-}
-
-static int setup_process_counters_amd(process_t *p) {
-    if (!setup_raw_counter(&p->mem_loads, p->tgid, AMD_LS_DISPATCH_LOADS))
-        if (!setup_raw_counter(&p->mem_loads, p->tgid, AMD_LS_DISPATCH_ALL))
-            setup_cache_counter(&p->mem_loads, p->tgid,
-                PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
-
-    if (!setup_raw_counter(&p->dtlb_walks, p->tgid, AMD_L1_DTLB_MISS))
-        setup_raw_counter(&p->dtlb_walks, p->tgid, AMD_DTLB_LOAD_MISS_WALK);
-
-    init_counter(&p->dtlb_walk_completed);
     return (p->mem_loads.num_fds > 0);
 }
 
@@ -853,6 +863,8 @@ static int setup_process_counters_generic(process_t *p) {
     setup_cache_counter(&p->dtlb_walks, p->tgid,
         PERF_COUNT_HW_CACHE_DTLB, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_MISS);
     init_counter(&p->dtlb_walk_completed);
+    init_counter(&p->mem_stores);
+    init_counter(&p->dtlb_store_walks);
     return (p->mem_loads.num_fds > 0);
 }
 
@@ -861,44 +873,55 @@ static int setup_process_counters(process_t *p) {
 
     if (use_raw_events) {
         if (cpu_vendor == 2)
-            return setup_process_counters_amd(p);
+            return setup_process_counters_raw(p, &amd_events);
         if (cpu_vendor == 1 && intel_arch >= UARCH_SKX)
-            return setup_process_counters_intel_skx(p);
+            return setup_process_counters_raw(p, &skx_events);
         if (cpu_vendor == 1)
-            return setup_process_counters_intel_snb(p);
+            return setup_process_counters_raw(p, &snb_events);
     }
     return setup_process_counters_generic(p);
+}
+
+static int counter_has_tid(perf_counter_t *pc, pid_t tid) {
+    for (int i = 0; i < pc->num_fds; i++)
+        if (pc->tids[i] == tid) return 1;
+    return 0;
+}
+
+static void reconcile_counter(perf_counter_t *pc, pid_t *tids, int nt) {
+    if (!pc->active) return;
+
+    for (int i = 0; i < pc->num_fds; ) {
+        int alive = 0;
+        for (int j = 0; j < nt; j++)
+            if (tids[j] == pc->tids[i]) { alive = 1; break; }
+        if (alive) { i++; continue; }
+        close(pc->fds[i]);
+        pc->fds[i] = pc->fds[pc->num_fds - 1];
+        pc->tids[i] = pc->tids[pc->num_fds - 1];
+        pc->num_fds--;
+    }
+
+    for (int j = 0; j < nt && pc->num_fds < MAX_THREADS; j++) {
+        if (counter_has_tid(pc, tids[j])) continue;
+        struct perf_event_attr pe = pc->pe;
+        int fd = perf_event_open(&pe, tids[j], -1, -1, 0);
+        if (fd != -1) {
+            ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+            ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+            pc->fds[pc->num_fds] = fd;
+            pc->tids[pc->num_fds] = tids[j];
+            pc->num_fds++;
+        }
+    }
 }
 
 static void refresh_process_counters(process_t *p) {
     pid_t tids[MAX_THREADS];
     int nt = get_thread_ids(p->tgid, tids, MAX_THREADS);
-    if (nt <= p->mem_loads.num_fds) return;
-
-    for (int i = p->mem_loads.num_fds; i < nt && p->mem_loads.num_fds < MAX_THREADS; i++) {
-        struct perf_event_attr pe = p->mem_loads.pe;
-        int fd = perf_event_open(&pe, tids[i], -1, -1, 0);
-        if (fd != -1) {
-            ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-            p->mem_loads.fds[p->mem_loads.num_fds++] = fd;
-        }
-        if (p->dtlb_walks.num_fds > 0 && p->dtlb_walks.num_fds < MAX_THREADS) {
-            pe = p->dtlb_walks.pe;
-            fd = perf_event_open(&pe, tids[i], -1, -1, 0);
-            if (fd != -1) {
-                ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-                p->dtlb_walks.fds[p->dtlb_walks.num_fds++] = fd;
-            }
-        }
-        if (p->dtlb_walk_completed.num_fds > 0 && p->dtlb_walk_completed.num_fds < MAX_THREADS) {
-            pe = p->dtlb_walk_completed.pe;
-            fd = perf_event_open(&pe, tids[i], -1, -1, 0);
-            if (fd != -1) {
-                ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-                p->dtlb_walk_completed.fds[p->dtlb_walk_completed.num_fds++] = fd;
-            }
-        }
-    }
+    reconcile_counter(&p->mem_loads, tids, nt);
+    reconcile_counter(&p->dtlb_walks, tids, nt);
+    reconcile_counter(&p->dtlb_walk_completed, tids, nt);
 }
 
 static int is_kernel_thread(pid_t pid) {
@@ -959,6 +982,7 @@ static void add_process(pid_t pid) {
     memset(p, 0, sizeof(*p));
     p->tgid = tgid;
     init_counter(&p->mem_loads); init_counter(&p->dtlb_walks); init_counter(&p->dtlb_walk_completed);
+    init_counter(&p->mem_stores); init_counter(&p->dtlb_store_walks);
     strncpy(p->name, name, sizeof(p->name)-1);
 
     if (!setup_process_counters(p)) return;
@@ -966,6 +990,8 @@ static void add_process(pid_t pid) {
     p->prev_mem_loads_rd         = read_counter_full(&p->mem_loads);
     p->prev_dtlb_walks_rd       = (p->dtlb_walks.num_fds > 0) ? read_counter_full(&p->dtlb_walks) : (counter_reading_t){0,0,0};
     p->prev_dtlb_walk_completed_rd = (p->dtlb_walk_completed.num_fds > 0) ? read_counter_full(&p->dtlb_walk_completed) : (counter_reading_t){0,0,0};
+    p->prev_mem_stores_rd        = (p->mem_stores.num_fds > 0) ? read_counter_full(&p->mem_stores) : (counter_reading_t){0,0,0};
+    p->prev_dtlb_store_walks_rd  = (p->dtlb_store_walks.num_fds > 0) ? read_counter_full(&p->dtlb_store_walks) : (counter_reading_t){0,0,0};
     p->last_sample_time = get_time_ms();
     p->multiplex_pct = 100.0;
 
@@ -982,6 +1008,8 @@ static void cleanup_dead_processes(void) {
             close_counter(&procs[i].mem_loads);
             close_counter(&procs[i].dtlb_walks);
             close_counter(&procs[i].dtlb_walk_completed);
+            close_counter(&procs[i].mem_stores);
+            close_counter(&procs[i].dtlb_store_walks);
             procs[i].active = 0;
         }
     }
@@ -1002,14 +1030,13 @@ static void scan_processes(void) {
 
 static void apply_steering_matrix(process_t *p) {
     if (!p->mitosis_enabled) return;
-    prctl(PR_SET_PGTABLE_REPL_STEERING, steering_matrix, p->tgid, numa_node_count, 0);
+    p->steering_applied =
+        (prctl(PR_SET_PGTABLE_REPL_STEERING, steering_matrix, p->tgid, 0, 0) == 0);
 }
 
 static void enable_mitosis(process_t *p) {
     if (p->mitosis_enabled) return;
-    unsigned long mask = build_node_bitmask();
-    if (mask < 2) return;
-    if (prctl(PR_SET_PGTABLE_REPL, mask, p->tgid, 0, 0) == 0) {
+    if (prctl(PR_SET_PGTABLE_REPL, 1, p->tgid, 0, 0) == 0) {
         p->mitosis_enabled = 1; mitosis_count++;
         apply_steering_matrix(p);
     }
@@ -1031,6 +1058,13 @@ static void update_and_decide(void) {
 
         refresh_process_counters(p);
 
+        if (p->mitosis_enabled &&
+            prctl(PR_GET_PGTABLE_REPL, p->tgid, 0, 0, 0) != 1) {
+            p->mitosis_enabled = 0;
+            p->steering_applied = 0;
+            mitosis_count--;
+        }
+
         counter_reading_t ml_rd  = read_counter_full(&p->mem_loads);
         counter_reading_t dw_rd  = (p->dtlb_walks.num_fds > 0)
                                      ? read_counter_full(&p->dtlb_walks)
@@ -1038,10 +1072,18 @@ static void update_and_decide(void) {
         counter_reading_t dwc_rd = (p->dtlb_walk_completed.num_fds > 0)
                                      ? read_counter_full(&p->dtlb_walk_completed)
                                      : (counter_reading_t){0,0,0};
+        counter_reading_t ms_rd  = (p->mem_stores.num_fds > 0)
+                                     ? read_counter_full(&p->mem_stores)
+                                     : (counter_reading_t){0,0,0};
+        counter_reading_t dsw_rd = (p->dtlb_store_walks.num_fds > 0)
+                                     ? read_counter_full(&p->dtlb_store_walks)
+                                     : (counter_reading_t){0,0,0};
 
         long long d_mem       = scaled_delta(&ml_rd,  &p->prev_mem_loads_rd);
         long long d_walk      = scaled_delta(&dw_rd,  &p->prev_dtlb_walks_rd);
         long long d_walk_comp = scaled_delta(&dwc_rd, &p->prev_dtlb_walk_completed_rd);
+        long long d_mem_st    = scaled_delta(&ms_rd,  &p->prev_mem_stores_rd);
+        long long d_store_walk = scaled_delta(&dsw_rd, &p->prev_dtlb_store_walks_rd);
 
         double elapsed_ms = now - p->last_sample_time;
         if (elapsed_ms < 1.0) elapsed_ms = 1.0;
@@ -1051,20 +1093,32 @@ static void update_and_decide(void) {
         r = mux_ratio(&ml_rd,  &p->prev_mem_loads_rd);  if (r < worst_mux) worst_mux = r;
         r = mux_ratio(&dw_rd,  &p->prev_dtlb_walks_rd); if (r < worst_mux) worst_mux = r;
         r = mux_ratio(&dwc_rd, &p->prev_dtlb_walk_completed_rd); if (r < worst_mux) worst_mux = r;
+        if (p->mem_stores.num_fds > 0) {
+            r = mux_ratio(&ms_rd, &p->prev_mem_stores_rd); if (r < worst_mux) worst_mux = r;
+        }
+        if (p->dtlb_store_walks.num_fds > 0) {
+            r = mux_ratio(&dsw_rd, &p->prev_dtlb_store_walks_rd); if (r < worst_mux) worst_mux = r;
+        }
         p->multiplex_pct = worst_mux * 100.0;
 
         p->prev_mem_loads_rd         = ml_rd;
         p->prev_dtlb_walks_rd       = dw_rd;
         p->prev_dtlb_walk_completed_rd = dwc_rd;
+        p->prev_mem_stores_rd        = ms_rd;
+        p->prev_dtlb_store_walks_rd  = dsw_rd;
         p->last_sample_time = now;
 
-        p->last_mar = (double)d_mem * 1000.0 / elapsed_ms;
+        p->last_mar = (double)(d_mem + d_mem_st) * 1000.0 / elapsed_ms;
 
-        if (d_mem > 0) {
-            long long walks = (d_walk > 0) ? d_walk : d_walk_comp;
-            p->last_dtlb_mr = (double)walks / (double)d_mem;
-        } else {
-            p->last_dtlb_mr = 0.0;
+        {
+            long long load_walks  = (d_walk > 0) ? d_walk : d_walk_comp;
+            long long total_walks = load_walks + d_store_walk;
+            long long mem_access  = d_mem + d_mem_st;
+
+            if (mem_access > 0)
+                p->last_dtlb_mr = (double)total_walks / (double)mem_access;
+            else
+                p->last_dtlb_mr = 0.0;
         }
 
         if (now - p->last_pf_sample_time >= PF_SAMPLE_INTERVAL) {
@@ -1092,6 +1146,9 @@ static void update_and_decide(void) {
             if (p->mitosis_enabled && (now - p->below_threshold_since) >= HYSTERESIS_MS)
                 disable_mitosis(p);
         }
+
+        if (p->mitosis_enabled && !p->steering_applied)
+            apply_steering_matrix(p);
     }
 }
 
@@ -1241,7 +1298,7 @@ static void draw_processes(int sr, int *er) {
         char hbuf[16] = "";
 
         if (p->mitosis_enabled) {
-            status = "ACTIVE"; color = GREEN;
+            status = p->steering_applied ? "ACTIVE" : "ACTIVE*"; color = GREEN;
             if (p->below_threshold_since > 0) {
                 int rem = HYSTERESIS_MS - (int)(now - p->below_threshold_since);
                 if (rem > 0) snprintf(hbuf, sizeof(hbuf), "-%dms", rem);
@@ -1272,24 +1329,14 @@ static void draw_processes(int sr, int *er) {
     *er = row;
 }
 
-static void draw_footer(void) {
-    GOTO(term_rows, 1);
-    printf(BG_BLUE " q" RESET " Quit  "
-           BG_BLUE " r" RESET " Remeasure  "
-           BG_BLUE " c" RESET " Cache+100  "
-           BG_BLUE " d" RESET " DrainCache  "
-           BG_BLUE " m" RESET " ToggleMode");
-    for (int i = 68; i < term_cols; i++) printf(" ");
-}
-
 static void draw_screen(void) {
     get_term_size(); printf(HOME CLEAR);
     draw_header();
     int mh = active_node_count + 3;
     draw_ptl_matrix(5);
     int er; draw_processes(5 + mh + 1, &er);
-    for (int r = er; r < term_rows - 1; r++) { GOTO(r, 1); printf(ESC "[K"); }
-    draw_footer(); fflush(stdout);
+    for (int r = er; r <= term_rows; r++) { GOTO(r, 1); printf(ESC "[K"); }
+    fflush(stdout);
 }
 
 static void signal_handler(int sig) { (void)sig; stop_requested = 1; }
@@ -1301,25 +1348,11 @@ static void cleanup(void) {
         close_counter(&procs[i].mem_loads);
         close_counter(&procs[i].dtlb_walks);
         close_counter(&procs[i].dtlb_walk_completed);
+        close_counter(&procs[i].mem_stores);
+        close_counter(&procs[i].dtlb_store_walks);
     }
     cleanup_ptl_buffers();
     if (mitosis_available) mitosis_set_inherit(1);
-}
-
-static void parse_node_mask(const char *arg) {
-    memset(node_mask_enabled, 0, sizeof(node_mask_enabled));
-    node_mask_set = 1;
-    char buf[256];
-    strncpy(buf, arg, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-    char *tok = strtok(buf, ",");
-    while (tok) {
-        while (*tok == ' ') tok++;
-        int n = atoi(tok);
-        if (n >= 0 && n < MAX_NUMA_NODES)
-            node_mask_enabled[n] = 1;
-        tok = strtok(NULL, ",");
-    }
 }
 
 static void print_usage(const char *prog) {
@@ -1327,8 +1360,6 @@ static void print_usage(const char *prog) {
     printf("  -i N       PTL measurement interval in ms [default: %d]\n", PTL_UPDATE_INTERVAL);
     printf("  -u N       Main loop interval in ms [default: %d]\n", UPDATE_INTERVAL_MS);
     printf("  -y N       Hysteresis duration in ms [default: %d]\n", HYSTERESIS_MS);
-    printf("  -c N       Pre-populate cache with N pages/node\n");
-    printf("  -n M       Node mask: comma-separated list of nodes, e.g. 0,2,3 [default: all]\n");
     printf("  -g         Force generic HW_CACHE events (disable raw)\n");
     printf("  -h         Show this help\n");
 }
@@ -1339,15 +1370,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int initial_cache = 0, force_generic = 0;
+    int force_generic = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0) { print_usage(argv[0]); return 0; }
         else if (strcmp(argv[i], "-i") == 0 && i+1 < argc) ptl_interval = atoi(argv[++i]);
         else if (strcmp(argv[i], "-u") == 0 && i+1 < argc) UPDATE_INTERVAL_MS = atoi(argv[++i]);
         else if (strcmp(argv[i], "-y") == 0 && i+1 < argc) HYSTERESIS_MS = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-c") == 0 && i+1 < argc) initial_cache = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-n") == 0 && i+1 < argc) parse_node_mask(argv[++i]);
         else if (strcmp(argv[i], "-g") == 0) force_generic = 1;
     }
 
@@ -1379,18 +1408,11 @@ int main(int argc, char *argv[]) {
 
     fprintf(stderr, "Detected %d NUMA node(s)\n", numa_node_count);
 
-    apply_node_subset();
     active_node_count = count_active_nodes();
 
     if (active_node_count < 2) {
         fprintf(stderr, "Error: need >= 2 active NUMA nodes (found %d)\n", active_node_count);
         return 1;
-    }
-
-    if (node_mask_set) {
-        char nbuf[256];
-        format_node_mask(nbuf, sizeof(nbuf));
-        fprintf(stderr, "Node mask: {%s} (%d nodes)\n", nbuf, active_node_count);
     }
 
     init_ptl_buffers();
@@ -1401,7 +1423,6 @@ int main(int argc, char *argv[]) {
     if (mitosis_available) {
         mitosis_update_status();
         mitosis_set_inherit(0);
-        if (initial_cache > 0) mitosis_populate_cache(initial_cache);
     } else {
         fprintf(stderr, "Warning: %s not found - kernel module may not be loaded\n", MITOSIS_PROC_DIR);
     }
@@ -1410,15 +1431,6 @@ int main(int argc, char *argv[]) {
     last_ptl_update = 0;
 
     while (!stop_requested) {
-        char c;
-        if (read(STDIN_FILENO, &c, 1) == 1) {
-            if (c == 'q' || c == 'Q') break;
-            if (c == 'r' || c == 'R') last_ptl_update = 0;
-            if ((c == 'c' || c == 'C') && mitosis_available) mitosis_populate_cache(100);
-            if ((c == 'd' || c == 'D') && mitosis_available) mitosis_drain_cache();
-            if ((c == 'm' || c == 'M') && mitosis_available) mitosis_set_mode((mitosis_mode+2)%3-1);
-        }
-
         cleanup_dead_processes();
         scan_processes();
 
